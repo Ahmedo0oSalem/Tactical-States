@@ -12,6 +12,9 @@ There are two pipelines:
 | **Possession pipeline** | `possession_pipeline.py` | PFF possession **sequence** (a team's spell on the ball) |
 | **Tactical phase pipeline** | `build_tactical_phases.py` | **Tactical phase** (a sequence cut into shorter, tactically coherent windows) |
 
+A third script, `unified_prediction.py`, trains models on the phase dataset. See
+[Training models](#training-models) below.
+
 The phase pipeline imports its feature machinery from the possession pipeline, so the two
 share the same loaders, feature code, and output schema. They differ only in how play is
 segmented.
@@ -56,6 +59,42 @@ of each script to scale up or down. The phase pipeline imports `possession_pipel
 so keep both files in the same folder.
 
 You will need `numpy`, `pandas`, `scipy`, `matplotlib`, `mplsoccer`, and `pyarrow`.
+
+## Training models
+
+`unified_prediction.py` trains on the phase dataset produced by `build_tactical_phases.py`.
+It does two things, using the same features and the same train/test split for both:
+
+- **Task A** predicts the full 75×45 pitch-control map for a phase (3,375 values), by
+  running the maps through PCA and fitting one regressor per component.
+- **Task B** predicts four scalar targets: `xt_mean`, `obso_mean`, `off_ball_xt_mean`,
+  and `das_score_mean`.
+
+The split is grouped by match, so no match ends up in both train and test. Features come
+in three sets, which are all fitted separately:
+
+- **Attacking Team Dynamics & Formations**: attacking shape, team speed, event counts, and formation.
+- **Complete Tactical Context(attack & defend)**: everything in the first set, plus defending shape and the attack/defence interactions.
+- **Formations**: formation only.
+
+The default model is scikit-learn's `HistGradientBoostingRegressor`, and it also uses
+`XGBRegressor` if you have XGBoost installed.
+
+```bash
+python unified_prediction.py
+```
+
+**Input types.** It reads a single parquet file, the tactical phases dataset, so set
+`INPUT_PATH` at the top of the script to point at the one you want to train on. The file
+needs to carry:
+
+- the `pc_map` column, the flat 75×45 pitch-control list, which is the Task A target,
+- the four scalar target columns listed above, which are the Task B targets,
+- the feature columns the phase pipeline writes: team shape, speed, event count, and
+  formation columns.
+
+Plot PNGs and a `unified_results.json` summary are written to `ModelsOutput`. You will
+need `scikit-learn`, and `xgboost` if you want the second model.
 
 ## Options
 

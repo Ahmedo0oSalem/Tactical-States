@@ -139,76 +139,15 @@ def epv_value(epv_grid, x, y, pitch_length, pitch_width, direction):
     row = int(np.clip(gy / pitch_width * n_rows, 0, n_rows - 1))
     return float(epv_grid[row, col])
 
-def _parity_direction(team, period, meta):
-    """Fallback attacking direction when tracking geometry is unavailable.
+def get_base_directions(meta, extra_time=False):
+    key = "homeTeamStartLeftExtraTime" if extra_time else "homeTeamStartLeft"
+    hsl = meta.get(key, meta.get("homeTeamStartLeft", True))
+    return (1 if hsl else -1), (-1 if hsl else 1)
 
-    Ends change at half-time (period 1->2) and at the extra-time half-time (3->4), but
-    NOT at the start of extra time (2->3) -- a parity flip on every even period inverts
-    periods 3 and 4, so the earlier `period % 2` rule is replaced by this.
-
-    `homeTeamStartLeftExtraTime` is honoured only when present and non-null: some exports
-    ship it as `null`, and `dict.get` returns that null rather than the fallback, which
-    would silently mean "home started right" and invert every extra-time direction.
-    """
-    hsl = meta.get("homeTeamStartLeftExtraTime")
-    if hsl is None:
-        hsl = meta.get("homeTeamStartLeft")
-    if hsl is None:
-        hsl = True
-    base = 1 if hsl else -1
-    if team != "home":
-        base = -base
-    return base * (1 if int(period) in (1, 4) else -1)
-
-def resolve_attack_directions(track):
-    """Derive per-(team, period) attacking direction from tracking geometry.
-
-    The goalkeeper is the deepest player in every period, so the sign of the deepest
-    player's mean x identifies which goal a team defends; the attacking direction is the
-    opposite (+1 = attacks toward +x). This is metadata-independent and therefore correct
-    for all four periods, whereas the previous parity flip assumed teams change ends at
-    the start of extra time and inverted periods 3 and 4.
-
-    The result is cached on the track dict under "_attack_directions". Any period without
-    enough geometry falls back to `_parity_direction`.
-    """
-    cached = track.get("_attack_directions")
-    if cached is not None:
-        return cached
-
-    periods = np.asarray(track["period"])
-    pl = float(track["pitch_length"])
-    centre = pl / 2.0
-    directions = {}
-    for side, xy in (("home", track["home_xy"]), ("away", track["away_xy"])):
-        for p_val in np.unique(periods):
-            p = int(p_val)
-            team_xy = xy[periods == p]
-            mean_x = np.nanmean(np.where(np.isfinite(team_xy[:, :, 0]), team_xy[:, :, 0], np.nan), axis=0)
-            finite = np.isfinite(mean_x)
-            direction = None
-            if finite.any():
-                # coordinates are stored shifted so x in [0, pl]; centre is pl/2.
-                deepest = int(np.argmax(np.where(finite, np.abs(mean_x - centre), -np.inf)))
-                if abs(mean_x[deepest] - centre) > pl * 0.05:
-                    direction = 1 if mean_x[deepest] < centre else -1
-            if direction is None:
-                direction = _parity_direction(side, p, track["meta"])
-            directions[(side, p)] = direction
-
-    track["_attack_directions"] = directions
-    return directions
-
-def attack_direction(team, period, track):
-    """Attacking direction (+1 toward +x / right, -1 toward left) for (team, period).
-
-    `track` is the loader dict; the geometry-derived map is computed once and cached.
-    """
-    directions = resolve_attack_directions(track)
-    key = (team, int(period))
-    if key in directions:
-        return directions[key]
-    return _parity_direction(team, period, track["meta"])
+def attack_direction(team, period, meta):
+    h_dir, a_dir = get_base_directions(meta, extra_time=period in (3, 4))
+    base = h_dir if team == "home" else a_dir
+    return base * (1 if int(period) % 2 == 1 else -1)
 
 def compute_pitch_control_frame(home_xy, away_xy, pitch_length, pitch_width,
                                 grid_res_x=PC_GRID_RES_X,
@@ -239,54 +178,23 @@ def compute_pitch_control_frame(home_xy, away_xy, pitch_length, pitch_width,
     ownership = labels[nearest].reshape(grid_res_x, grid_res_y)
     return ownership
 
-def compute_pc_for_match(track, downsample=PC_DOWNSAMPLE, chunk=256):
-    """One row per sampled frame with a (grid_res_x, grid_res_y) uint8 map.
-
-    Frames are processed in chunks so the per-frame scipy `cdist` call (the dominant cost,
-    ~0.5 ms/frame over a 3375-point grid) is replaced by one batched call per chunk.
-    Numerics are identical: the same pairwise distances and the same argmin.
-    """
+def compute_pc_for_match(track, downsample=PC_DOWNSAMPLE):
+    """One row per sampled frame with a (grid_res_x, grid_res_y) uint8 map."""
     records = []
     n = len(track["period"])
-    frame_idx = np.arange(0, n, downsample)
-    for lo in range(0, len(frame_idx), chunk):
-        sel = frame_idx[lo:lo + chunk]
-        home = track["home_xy"][sel]
-        away = track["away_xy"][sel]
-        # Drop frames with too few valid players, matching compute_pitch_control_frame's
-        # guard (home + away finite players >= 4).
-        ok = []
-        for b in range(len(sel)):
-            hv = int(np.sum(np.all(np.isfinite(home[b]), axis=1)))
-            av = int(np.sum(np.all(np.isfinite(away[b]), axis=1)))
-            ok.append(hv + av >= 4)
-        sel = sel[ok]
-        if not len(sel):
+    for i in range(0, n, downsample):
+        ownership = compute_pitch_control_frame(
+            track["home_xy"][i], track["away_xy"][i],
+            track["pitch_length"], track["pitch_width"],
+        )
+        if ownership is None:
             continue
-        home, away = track["home_xy"][sel], track["away_xy"][sel]
-        B = len(sel)
-        pts = np.concatenate([home, away], axis=1).reshape(B, -1, 2)   # (B, P_home+P_away, 2)
-        labels = np.concatenate([
-            np.ones(home.shape[1], dtype=np.uint8),
-            np.zeros(away.shape[1], dtype=np.uint8)])
-        finite = np.all(np.isfinite(pts), axis=2)                      # (B, P)
-        xs = np.linspace(0, track["pitch_length"], PC_GRID_RES_X)
-        ys = np.linspace(0, track["pitch_width"], PC_GRID_RES_Y)
-        gx, gy = np.meshgrid(xs, ys, indexing="ij")
-        gp = np.column_stack((gx.ravel(), gy.ravel()))                 # (G, 2)
-        for b in range(B):
-            valid = finite[b]
-            if valid.sum() < 4:
-                continue
-            p = pts[b][valid]
-            lab = labels[valid]
-            nearest = np.argmin(cdist(gp, p), axis=1)
-            records.append({
-                "period":    int(track["period"][sel[b]]),
-                "elapsed":   float(track["elapsed"][sel[b]]),
-                "frame_idx": int(sel[b]),
-                "pc_map":    lab[nearest].reshape(PC_GRID_RES_X, PC_GRID_RES_Y),
-            })
+        records.append({
+            "period":    int(track["period"][i]),
+            "elapsed":   float(track["elapsed"][i]),
+            "frame_idx": i,
+            "pc_map":    ownership,
+        })
     return pd.DataFrame(records)
 
 def compute_obso_for_match(track, epv_grid, owner_lookup, radius=OBSO_RADIUS_M, downsample=OBSO_DOWNSAMPLE):
@@ -296,11 +204,6 @@ def compute_obso_for_match(track, epv_grid, owner_lookup, radius=OBSO_RADIUS_M, 
     step = 1.0
     offsets = [(dx, dy) for dx in np.arange(-radius, radius + step, step)
                for dy in np.arange(-radius, radius + step, step) if dx * dx + dy * dy <= radius * radius]
-    # Vectorize the 81 per-frame epv_value calls: the probe lattice is fixed, so only the
-    # ball anchor and the x-mirror vary per frame. Out-of-pitch probes are masked to -inf,
-    # matching the scalar loop's `continue` rather than reading a clipped edge cell.
-    n_rows, n_cols = epv_grid.shape
-    offs = np.array(offsets, dtype=float)                      # (K, 2)
     records = []
     for i in range(0, n, downsample):
         bx, by = track["ball_xy"][i]
@@ -308,24 +211,14 @@ def compute_obso_for_match(track, epv_grid, owner_lookup, radius=OBSO_RADIUS_M, 
         period = int(track["period"][i])
         team = owner_lookup(period, i)
         if team is None: continue
-        direction = attack_direction(team, period, track)
-        # Mirror the whole probe coordinate, not just the ball: the scalar path calls
-        # epv_value(bx + dx), which mirrors the sum, so the offset's x-sign must flip too.
-        px = bx + offs[:, 0] if direction == 1 else (pl - (bx + offs[:, 0]))
-        py = by + offs[:, 1]
-        # The ball's own cell always counts (the scalar path evaluates it before the
-        # lattice loop), so keep it in-pitch even when the ball sits just outside the
-        # touchline; the surrounding probes are still masked out.
-        in_pitch = (px >= 0) & (px <= pl) & (py >= 0) & (py <= pw)
-        ball_gx = bx if direction == 1 else (pl - bx)
-        ball_col = int(np.clip(ball_gx / pl * n_cols, 0, n_cols - 1))
-        ball_row = int(np.clip(by / pw * n_rows, 0, n_rows - 1))
-        ball_val = epv_grid[ball_row, ball_col]
-        col = np.clip((px / pl * n_cols).astype(int), 0, n_cols - 1)
-        row = np.clip((py / pw * n_rows).astype(int), 0, n_rows - 1)
-        vals = np.where(in_pitch, epv_grid[row, col], -np.inf)
-        records.append({"period": period, "elapsed": float(track["elapsed"][i]), "team": team,
-                        "obso": float(max(vals.max(), ball_val))})
+        direction = attack_direction(team, period, track["meta"])
+        max_epv = epv_value(epv_grid, bx, by, pl, pw, direction)
+        for dx, dy in offsets:
+            xt, yt = bx + dx, by + dy
+            if xt < 0 or xt > pl or yt < 0 or yt > pw: continue
+            v = epv_value(epv_grid, xt, yt, pl, pw, direction)
+            if v > max_epv: max_epv = v
+        records.append({"period": period, "elapsed": float(track["elapsed"][i]), "team": team, "obso": max_epv})
     return pd.DataFrame(records)
 
 def compute_signed_epv_series(track, epv_grid, owner_lookup):
@@ -339,7 +232,7 @@ def compute_signed_epv_series(track, epv_grid, owner_lookup):
         period = int(track["period"][i])
         team = owner_lookup(period, i)
         if team is None: continue
-        direction = attack_direction(team, period, track)
+        direction = attack_direction(team, period, track["meta"])
         v = epv_value(epv_grid, bx, by, pl, pw, direction)
         records.append({"period": period, "elapsed": float(track["elapsed"][i]),
                          "team": team, "signed_epv": v if team == "home" else -v})
@@ -383,9 +276,7 @@ def compute_das_and_offball_xt_for_match(track, epv_grid, owner_lookup, xt_grid=
 
     pl, pw = track["pitch_length"], track["pitch_width"]
     grid_points = _grid_points(pl, pw, grid_res)
-    # _grid_points uses np.linspace, so the actual point spacing is L/(grid_res-1), not
-    # L/grid_res; the area of the grid each point represents must match that spacing.
-    cell_area = (pl / (grid_res - 1)) * (pw / (grid_res - 1))
+    cell_area = (pl / grid_res) * (pw / grid_res)
 
     epv_dir = {1: _grid_value_lookup(epv_grid, grid_points, pl, pw, 1),
                -1: _grid_value_lookup(epv_grid, grid_points, pl, pw, -1)}
@@ -399,7 +290,7 @@ def compute_das_and_offball_xt_for_match(track, epv_grid, owner_lookup, xt_grid=
         team = owner_lookup(period, i)
         if team is None:
             continue
-        direction = attack_direction(team, period, track)
+        direction = attack_direction(team, period, track["meta"])
 
         home_xy_i, away_xy_i = track["home_xy"][i], track["away_xy"][i]
         home_valid = np.all(np.isfinite(home_xy_i), axis=1)
@@ -464,13 +355,14 @@ def compute_signed_xt_series_vectorized(track, xt_grid, owner_arr):
     idx = np.where(valid)[0]
     periods = track["period"][idx].astype(int)
     teams = np.array([owner_arr[k] for k in idx])
+    meta = track["meta"]
 
     direction = np.empty(len(idx), dtype=np.int8)
     for team_val in ("home", "away"):
         for p_val in np.unique(periods):
             m = (teams == team_val) & (periods == p_val)
             if m.any():
-                direction[m] = attack_direction(team_val, int(p_val), track)
+                direction[m] = attack_direction(team_val, int(p_val), meta)
 
     bx, by = ball_xy[idx, 0], ball_xy[idx, 1]
     gx = np.where(direction == 1, bx, pl - bx)
@@ -522,26 +414,6 @@ def load_tracking(match_id, processed_dir):
                 rows.append(json.loads(line))
             except:
                 continue
-
-    # The provider occasionally writes one instant multiple times (contiguous blocks of
-    # 2, 4 or 16 rows sharing an identical (period, frameNum), differing only in the
-    # smoothed-position variants). Every frame-based routine treats frame_num as a
-    # unique key -- frame_range_mask turns a frame range into a row count via searchsorted,
-    # so a duplicated frame number inflates the count and biases the aggregates that read
-    # those rows. Drop the repeats, keeping the first occurrence (raw positions, which are
-    # what the loader prefers anyway).
-    seen_instants = set()
-    deduped = []
-    for fr in rows:
-        key = (fr.get("period", 0), fr.get("frameNum"))
-        if key in seen_instants:
-            continue
-        seen_instants.add(key)
-        deduped.append(fr)
-    if len(deduped) != len(rows):
-        logger.info(f"[{match_id}] Dropped {len(rows) - len(deduped)} duplicate-frame rows "
-                    f"({len(rows)} -> {len(deduped)})")
-    rows = deduped
 
     if not rows:
         return None
@@ -638,18 +510,6 @@ def load_tracking(match_id, processed_dir):
         gc_sorted = np.array([], dtype=np.float32)
         gc_frame_idx = np.array([], dtype=np.int64)
 
-    # Per-period game-clock index. The match clock is monotonic within each period but
-    # jumps BACKWARD at period boundaries (each half restarts at its nominal kickoff time),
-    # so a single global searchsorted can resolve a clock in the overlap region to a frame
-    # of the neighbouring period. Scoping by period removes that ambiguity.
-    period_game_clock_index = {}
-    for p in np.unique(period):
-        p_idx = np.where((period == p) & gc_valid)[0]
-        if not len(p_idx):
-            continue
-        p_order = np.argsort(game_clock[p_idx])
-        period_game_clock_index[int(p)] = (game_clock[p_idx][p_order], p_idx[p_order])
-
     pe_to_frames = defaultdict(list)
     for i, pe in enumerate(possession_event_ids):
         if pe > 0: pe_to_frames[int(pe)].append(i)
@@ -692,7 +552,6 @@ def load_tracking(match_id, processed_dir):
             "_elapsed_sorted": elapsed[order_time], "_frame_idx_sorted_time": order_time,
             "_period_time_index": period_time_index,
             "_game_clock_sorted": gc_sorted, "_game_clock_frame_idx": gc_frame_idx,
-            "_period_game_clock_index": period_game_clock_index,
             "possession_event_ids": possession_event_ids, "game_event_ids": game_event_ids,
             "_pe_to_frames": dict(pe_to_frames), "_ge_to_frames": dict(ge_to_frames)}
 
@@ -713,20 +572,9 @@ def frame_at_time(track, target_time, period=None):
     pos = min(np.searchsorted(times, target_time, "left"), len(times) - 1)
     return int(track["_frame_idx_sorted_time"][pos])
 
-def frame_at_game_clock(track, target_game_clock, period=None):
-    """Nearest frame at or after `target_game_clock`.
-
-    When `period` is supplied the search is scoped to that period, because the match clock
-    jumps backward at period boundaries (each half restarts at its nominal kickoff time)
-    and a global lookup in the overlap region can resolve to a frame of the neighbouring
-    period. Falls back to the global index when the period is unknown or empty.
-    """
+def frame_at_game_clock(track, target_game_clock):
     gc = track.get("_game_clock_sorted")
     idx_arr = track.get("_game_clock_frame_idx")
-    if period is not None:
-        p_idx = track.get("_period_game_clock_index", {}).get(int(period))
-        if p_idx is not None and len(p_idx[0]):
-            gc, idx_arr = p_idx
     if gc is None or idx_arr is None or len(gc) == 0:
         return None
     if not np.isfinite(target_game_clock):
@@ -768,7 +616,7 @@ def frame_of_event(track, ev, prefer_last=False, max_scan=25):
                         return f
     gc = _get(ev, GE_CLOCK_KEYS)
     if gc is not None:
-        fi = frame_at_game_clock(track, float(gc), _get(ev, ["period"]))
+        fi = frame_at_game_clock(track, float(gc))
         if fi is not None:
             return fi
     return None
@@ -790,14 +638,9 @@ PE_TYPE_KEYS = ["possession_event_type", "possessionEventType"]
 PE_OUTCOME_KEYS = ["outcome", "outcomeType", "passOutcomeType", "crossOutcomeType"]
 PE_LINES_BROKEN_KEYS = ["linesBrokenType"]
 PE_PASS_TYPE_KEYS = ["passType"]
-PE_CROSS_TYPE_KEYS = ["crossType"]
 PE_ACCURACY_KEYS = ["accuracyType"]
 PE_INCOMPLETION_KEYS = ["incompletionReasonType"]
-# PFF deprecated the boolean `carrySuccessful` (shipped as null in current exports) in
-# favour of ballCarryOutcome: R = Retains, L = Ball Loss, S = Stoppage (event spec 4.5).
-# Only "R" counts as a successful carry.
-PE_CARRY_SUCCESS_KEYS = ["ballCarryOutcome", "carrySuccessful"]
-PE_CARRY_SUCCESS_VALUES = ("R", True)
+PE_CARRY_SUCCESS_KEYS = ["carrySuccessful"]
 PE_SHOT_OUTCOME_KEYS = ["shotOutcomeType"]
 PE_PRESSURE_KEYS = ["pressureType"]
 PE_OPPORTUNITY_KEYS = ["opportunityType"]
@@ -816,8 +659,7 @@ PE_START_FRAME_KEYS = ["start_frame", "startFrame"]
 PE_END_FRAME_KEYS = ["end_frame", "endFrame"]
 GE_GAME_EVENT_TYPE_KEYS = ["game_event_type", "gameEventType"]
 
-_SUBDICT_KEYS = ("gameEvents", "initialTouch", "possessionEvents", "fouls",
-                 "grades", "game_event", "possession_event")
+_SUBDICT_KEYS = ("gameEvents", "initialTouch", "possessionEvents", "fouls", "game_event", "possession_event")
 def flatten_event(rec):
     if not isinstance(rec, dict): return {}
     flat = dict(rec)
@@ -843,14 +685,14 @@ def _possession_frame_bounds(track, rows):
         return None, None
     return min(all_frames), max(all_frames)
 
-def _game_clock_bounds(track, rows, period=None):
+def _game_clock_bounds(track, rows):
     clocks = [_get(r, GE_CLOCK_KEYS) for r in rows if _get(r, GE_CLOCK_KEYS) is not None]
     if not clocks:
         return None, None
     start_gc = float(min(clocks))
     end_gc   = float(max(clocks))
-    start_idx = frame_at_game_clock(track, start_gc, period)
-    end_idx   = frame_at_game_clock(track, end_gc, period)
+    start_idx = frame_at_game_clock(track, start_gc)
+    end_idx   = frame_at_game_clock(track, end_gc)
     return start_idx, end_idx
 
 def build_possessions_from_events(events, track):
@@ -889,7 +731,7 @@ def build_possessions_from_events(events, track):
 
         start_idx, end_idx = _possession_frame_bounds(track, rows)
         if start_idx is None or end_idx is None:
-            gc_start, gc_end = _game_clock_bounds(track, rows, period)
+            gc_start, gc_end = _game_clock_bounds(track, rows)
             if gc_start is not None and gc_end is not None:
                 start_idx, end_idx = gc_start, gc_end
         if start_idx is None or end_idx is None:
@@ -930,9 +772,7 @@ def _dist_dict(values):
     values = [v for v in values if v is not None]
     return json.dumps(pd.Series(values).value_counts().to_dict()) if values else "{}"
 
-PE_CODE_NAMES = {"BC": "carry", "CH": "challenge", "CL": "clearance", "CR": "cross",
-                "FO": "foul", "IT": "initial_touch", "PA": "pass", "RE": "rebound",
-                "SH": "shot", "TC": "touch"}
+PE_CODE_NAMES = {"BC": "carry", "CH": "challenge", "CL": "clearance", "CR": "cross", "PA": "pass", "RE": "rebound", "SH": "shot"}
 
 def aggregate_possession_events(poss, track, direction):
     rows = poss["possession_events"]
@@ -946,23 +786,13 @@ def aggregate_possession_events(poss, track, direction):
     completed = [r for r in passes if _get(r, PE_OUTCOME_KEYS) == "C"]
     out["n_completed_passes"] = len(completed)
     out["pass_completion_rate"] = len(completed) / len(passes) if passes else np.nan
-
-    carries = [r for r, n in zip(rows, names) if n == "carry"]
-    # linesBrokenType applies to passes, carries AND dribbles, and PFF records dribbles as
-    # challenges (event spec 4.1/4.4/4.5), so challenges are included in the count.
-    line_breakers = passes + carries + [r for r, n in zip(rows, names) if n == "challenge"]
-    out["lines_broken_count"] = sum(1 for r in line_breakers
-                                    if _get(r, PE_LINES_BROKEN_KEYS) is not None)
-    # Passes carry passType; crosses carry their own crossType, so read the right field
-    # per row -- reading passType for a cross silently returns null.
-    out["pass_type_distribution"] = _dist_dict([
-        _get(r, PE_CROSS_TYPE_KEYS) if PE_CODE_NAMES.get(_get(r, PE_TYPE_KEYS)) == "cross"
-        else _get(r, PE_PASS_TYPE_KEYS) for r in passes])
+    out["lines_broken_count"] = sum(1 for r in passes if _get(r, PE_LINES_BROKEN_KEYS) is not None)
+    out["pass_type_distribution"] = _dist_dict([_get(r, PE_PASS_TYPE_KEYS) for r in passes])
     out["accuracy_type_distribution"] = _dist_dict([_get(r, PE_ACCURACY_KEYS) for r in completed])
     out["incompletion_reason_distribution"] = _dist_dict([_get(r, PE_INCOMPLETION_KEYS) for r in passes if r not in completed])
 
-    out["successful_carries"] = sum(1 for r in carries
-                                     if _get(r, PE_CARRY_SUCCESS_KEYS) in PE_CARRY_SUCCESS_VALUES)
+    carries = [r for r, n in zip(rows, names) if n == "carry"]
+    out["successful_carries"] = sum(1 for r in carries if _get(r, PE_CARRY_SUCCESS_KEYS) is True)
     out["carry_success_rate"] = out["successful_carries"] / len(carries) if carries else np.nan
     out["carry_intent_distribution"] = _dist_dict([_get(r, PE_CARRY_INTENT_KEYS) for r in carries])
     out["carry_type_distribution"] = _dist_dict([_get(r, PE_CARRY_TYPE_KEYS) for r in carries])
@@ -998,16 +828,10 @@ def aggregate_possession_events(poss, track, direction):
 # ==============================================================================
 # 6. VECTORIZED SPATIAL FEATURES
 # ==============================================================================
-def compute_all_spatial_features(track, needed_frames=None):
+def compute_all_spatial_features(track):
     length = track["pitch_length"]
     home_xy, away_xy, ball_xy = track["home_xy"], track["away_xy"], track["ball_xy"]
     N = len(track["period"])
-
-    # The per-frame ConvexHull loop dominates this function (~320 s of ~340 s per match),
-    # while only frames inside a possession are ever read by build_possession_row. When the
-    # caller supplies the union of possessed frames, hulls are computed for that subset only;
-    # every other array is still computed over all N frames so indexing is unchanged.
-    hull_mask = np.ones(N, dtype=bool) if needed_frames is None else np.asarray(needed_frames, dtype=bool)
 
     def get_shapes(xy_arr):
         centroids = np.nanmean(xy_arr, axis=1)
@@ -1021,7 +845,7 @@ def compute_all_spatial_features(track, needed_frames=None):
 
         area = np.full(N, np.nan)
         valid_frames = np.sum(np.all(np.isfinite(xy_arr), axis=2), axis=1) >= 3
-        for i in np.where(valid_frames & hull_mask)[0]:
+        for i in np.where(valid_frames)[0]:
             pts = xy_arr[i][np.all(np.isfinite(xy_arr[i]), axis=1)]
             if len(pts) >= 3:
                 try: area[i] = ConvexHull(pts).volume
@@ -1131,10 +955,7 @@ def agg_series(name, values, weights=None):
     idx = np.where(finite_mask)[0]
     out[f"{name}_start"] = float(arr[idx[0]])
     out[f"{name}_end"] = float(arr[idx[-1]])
-    # A single finite sample carries no change information: end - start is trivially 0,
-    # which is indistinguishable from a measured "no change". ~1.6% of possessions resolve
-    # to one frame yet still get a duration, so flag them as unknown instead.
-    out[f"{name}_change"] = (out[f"{name}_end"] - out[f"{name}_start"]) if len(idx) >= 2 else np.nan
+    out[f"{name}_change"] = out[f"{name}_end"] - out[f"{name}_start"]
     return out
 
 # ==============================================================================
@@ -1159,20 +980,9 @@ def identify_goalkeeper_by_distance(xy_arr, ids, min_frames=FORMATION_GK_MIN_FRA
     return {str(ids[min(candidates, key=candidates.get)])} if candidates else None
 
 def resolve_goalkeepers(track):
-    """Identify each side's goalkeeper.
-
-    Returns {(side, period): {shirt}}. The distance heuristic is run per period, not per
-    match: a sent-off or injured keeper (e.g. 3813's away #1, replaced by #24 at half-time)
-    otherwise leaves the replacement classified as an 11th outfielder for the rest of the
-    match, and the 11-vs-10 assignment silently drops the worst-fitting player.
-    """
-    periods = np.asarray(track["period"])
-    result = {}
-    for side, xy_arr, ids in (("home", track["home_xy"], track["home_ids"]),
-                              ("away", track["away_xy"], track["away_ids"])):
-        for p in np.unique(periods):
-            m = periods == p
-            result[(side, int(p))] = identify_goalkeeper_by_distance(xy_arr[m], ids)
+    result = goalkeepers_from_metadata(track["meta"])
+    if not result.get("home"): result["home"] = identify_goalkeeper_by_distance(track["home_xy"], track["home_ids"])
+    if not result.get("away"): result["away"] = identify_goalkeeper_by_distance(track["away_xy"], track["away_ids"])
     return result
 
 def build_templates(pitch_length, pitch_width):
@@ -1191,18 +1001,10 @@ def match_formation(player_xy, templates, orientation):
         if norm_cost < best_cost: best_cost, best_formation, best_names = norm_cost, formation, [tmpl["names"][i] for i in col_ind]
     return best_formation, best_cost, best_names
 
-def get_orientation(team, period, track):
-    """Template orientation ("normal" vs "flipped") for (team, period).
-
-    `match_formation` fits the team's *own* pitch coordinates against the template, so the
-    orientation depends only on which way THIS team is attacking -- "normal" when it plays
-    left-to-right (direction +1), "flipped" when right-to-left. Home/away identity must not
-    enter the comparison: both teams' shapes are described in their own attacking frame, and
-    conditioning on `team == "home"` silently mirrors the away side's template and yields the
-    mirror-image formation label.
-    """
-    direction = attack_direction(team, period, track)
-    return "normal" if direction == 1 else "flipped"
+def get_orientation(team, period, meta):
+    home_start_left = meta.get("homeTeamStartLeftExtraTime" if period in (3, 4) else "homeTeamStartLeft", meta.get("homeTeamStartLeft", True))
+    home_attacks_left_to_right = home_start_left if period % 2 == 1 else not home_start_left
+    return "normal" if (team == "home" and home_attacks_left_to_right) or (team == "away" and not home_attacks_left_to_right) else "flipped"
 
 def get_window_indices(elapsed_seconds, stride_seconds, window_seconds):
     return range(max(0, math.ceil((elapsed_seconds - window_seconds) / stride_seconds)), int(elapsed_seconds // stride_seconds) + 1)
@@ -1267,92 +1069,37 @@ def compute_frame_weights(track, events, stride=5):
     return w_home, w_away
 
 def accumulate_positions(track, goalkeepers, w_home, w_away, stride=5):
-    buckets = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0, 0.0, 0]))
-    gk = {(side, int(p)): s for (side, p), s in goalkeepers.items()} if goalkeepers else {}
-    period = track["period"]
-    elapsed = track["elapsed"]
-    n = len(period)
-    idx = np.arange(0, n, stride)
-    if not len(idx):
-        return buckets
-
-    for side, xy_arr, ids, w_arr in (("home", track["home_xy"], track["home_ids"], w_home),
-                                     ("away", track["away_xy"], track["away_ids"], w_away)):
-        n_players = xy_arr.shape[1]
-        xy = xy_arr[idx]                                   # (F, P, 2)
-        finite = np.isfinite(xy[:, :, 0]) & np.isfinite(xy[:, :, 1])
-        w = w_arr[idx]                                     # (F,)
-
-        # Window membership: frame at elapsed t belongs to window k when
-        # k*stride + window >= t, i.e. k <= (t - window) / stride ... computed once per frame.
-        el = elapsed[idx]
-        k_hi = (el / FORMATION_STRIDE_SECONDS).astype(int) + 1
-        k_lo = np.maximum(0, np.ceil((el - FORMATION_WINDOW_SECONDS) / FORMATION_STRIDE_SECONDS).astype(int))
-
-        per = period[idx].astype(int)
-        gk_ids = {int(p): gk.get((side, int(p)), set()) for p in np.unique(per)}
-        gk_mask = np.zeros((len(idx), n_players), dtype=bool)
-        for p, gk_set in gk_ids.items():
-            if not gk_set:
-                continue
-            m = per == p
-            # rows for this period only; other periods keep their own mask
-            gk_mask[m] = np.isin(np.array([str(x) for x in ids]), list(gk_set))
-
-        keep = finite & ~gk_mask
-        if not keep.any():
-            continue
-
-        f_idx, p_idx = np.nonzero(keep)                     # (M,) indices into the sampled arrays
-        xs, ys = xy[f_idx, p_idx, 0], xy[f_idx, p_idx, 1]
-        ws = w[f_idx]
-        ks_hi = k_hi[f_idx]
-        ks_lo = k_lo[f_idx]
-        reps = np.maximum(ks_hi - ks_lo, 0)
-        f_rep = np.repeat(f_idx, reps)
-        p_rep = np.repeat(p_idx, reps)
-        x_rep = np.repeat(xs, reps)
-        y_rep = np.repeat(ys, reps)
-        w_rep = np.repeat(ws, reps)
-        k_all = np.concatenate([np.arange(a, b) for a, b in zip(ks_lo, ks_hi)]) if len(reps) else np.array([], dtype=int)
-        if not len(k_all):
-            continue
-        per_all = per[f_rep]
-
-        # Single flat key over (period, window, player-slot) so four bincounts replace the
-        # Python triple loop; the accumulator holds [sum_w, sum_wx, sum_wy, count].
-        # n_k must be large enough that (per * n_k + k) never collides across periods, so
-        # take it from the global maximum window index rather than the max of this batch.
-        n_k = int(k_hi.max()) + 1
-        key = ((per_all * n_k + k_all) * n_players + p_rep)
-        b_w = np.bincount(key, weights=w_rep, minlength=key.max() + 1)
-        b_x = np.bincount(key, weights=w_rep * x_rep, minlength=key.max() + 1)
-        b_y = np.bincount(key, weights=w_rep * y_rep, minlength=key.max() + 1)
-        b_n = np.bincount(key, minlength=key.max() + 1)
-        for k_ in np.unique(key):
-            rest = k_ // n_players
-            slot, per_, kk = k_ % n_players, rest // n_k, rest % n_k
-            acc = buckets[(side, int(per_), int(kk))][ids[int(slot)]]
-            acc[0] += b_w[k_]; acc[1] += b_x[k_]; acc[2] += b_y[k_]; acc[3] += b_n[k_]
+    buckets = defaultdict(lambda: defaultdict(list))
+    gk = {"home": goalkeepers.get("home") or set(), "away": goalkeepers.get("away") or set()}
+    for i in range(0, len(track["period"]), stride):
+        period, elapsed = int(track["period"][i]), float(track["elapsed"][i])
+        for side, xy_arr, ids, w_arr in (("home", track["home_xy"], track["home_ids"], w_home), ("away", track["away_xy"], track["away_ids"], w_away)):
+            w = w_arr[i]
+            for j, pid in enumerate(ids):
+                if str(pid) in gk[side]: continue
+                x, y = xy_arr[i, j]
+                if not (np.isfinite(x) and np.isfinite(y)): continue
+                for k in get_window_indices(elapsed, FORMATION_STRIDE_SECONDS, FORMATION_WINDOW_SECONDS):
+                    buckets[(side, period, k)][pid].append((x, y, w))
     return buckets
 
 def build_formation_windows(track, templates, goalkeepers, w_home, w_away):
     buckets = accumulate_positions(track, goalkeepers, w_home, w_away)
     rows = []
     for (side, period, k), players in sorted(buckets.items()):
-        # accumulate_positions stores [sum_w, sum_wx, sum_wy, count] per player
-        n_frames = sum(v[3] for v in players.values())
+        n_frames = sum(len(v) for v in players.values())
         if n_frames < FORMATION_MIN_FRAMES_PER_WINDOW: continue
         avg_xy, weight_sum = [], 0.0
-        for pid, acc in players.items():
-            wsum = acc[0]
+        for pid, triples in players.items():
+            arr = np.array(triples, dtype=float)
+            wsum = arr[:, 2].sum()
             if wsum <= 0: continue
-            avg_xy.append((acc[1] / wsum, acc[2] / wsum))
+            avg_xy.append(((arr[:, 0] * arr[:, 2]).sum() / wsum, (arr[:, 1] * arr[:, 2]).sum() / wsum))
             weight_sum += wsum
         if not avg_xy: continue
         avg_xy = np.array(avg_xy)
         if avg_xy.shape[0] < FORMATION_MIN_OUTFIELD_PLAYERS: continue
-        orientation = get_orientation(side, period, track)
+        orientation = get_orientation(side, period, track["meta"])
         formation, cost, _ = match_formation(avg_xy, templates, orientation)
         fit_quality = 1.0 / (1.0 + float(cost))
         confidence = weight_sum * fit_quality
@@ -1436,7 +1183,7 @@ def build_possession_row(match_id, poss, track, pc_df, obso_df, formation_segmen
     meta = track["meta"]
     team, period = poss["team"], poss["period"]
     opp_team = "away" if team == "home" else "home"
-    direction = attack_direction(team, period, track)
+    direction = attack_direction(team, period, meta)
     length = track["pitch_length"]
 
     t0_period = poss["start_sec_period"]
@@ -1450,9 +1197,10 @@ def build_possession_row(match_id, poss, track, pc_df, obso_df, formation_segmen
     reliability_ratio = reliable_slots / total_slots if total_slots else np.nan
 
     per_frame_reliability = np.full(len(frame_idx), np.nan)
-    tot = has_home.sum(axis=1) + has_away.sum(axis=1)
-    rel = (rel_home & has_home).sum(axis=1) + (rel_away & has_away).sum(axis=1)
-    per_frame_reliability = np.where(tot > 0, rel / np.where(tot > 0, tot, 1), np.nan)
+    for k in range(len(frame_idx)):
+        tot = has_home[k].sum() + has_away[k].sum()
+        rel = (rel_home[k] & has_home[k]).sum() + (rel_away[k] & has_away[k]).sum()
+        per_frame_reliability[k] = rel / tot if tot else np.nan
 
     keep = np.ones(len(frame_idx), dtype=bool)
     weights = None
@@ -1522,12 +1270,7 @@ def build_possession_row(match_id, poss, track, pc_df, obso_df, formation_segmen
     }
 
     for key, vals in metrics.items():
-        # Reliability weights are 0-1 floats and only meaningful for continuous
-        # metrics; applying them to the integer player-count metrics would scale the
-        # counts by reliability instead of weighting them. The keys carry an
-        # "attacking_"/"defending_" prefix, so match on the suffix.
-        is_count = key.endswith(("players_ahead_of_ball", "players_behind_ball"))
-        use_weights = None if is_count else weights
+        use_weights = weights if key not in ("players_ahead_of_ball", "players_behind_ball") else None
         row.update(agg_series(key, vals, use_weights))
 
     dur = row["duration"] if row["duration"] and row["duration"] > 0 else np.nan
@@ -1632,12 +1375,7 @@ def build_match(match_id, processed_dir, epv_grid, xt_grid=None):
         if effective_xt_grid is not None else pd.DataFrame()
 
     logger.info(f"[{match_id}] Step 3.5/5: Precomputing spatial features (Vectorized)...")
-    # Only frames inside a possession are read downstream, so restrict the expensive
-    # per-frame convex-hull loop to that union (~53% of frames on the sample matches).
-    needed_frames = np.zeros(len(track["period"]), dtype=bool)
-    for p in possessions:
-        needed_frames[frame_range_mask(track, p["start_frame"], p["end_frame"])] = True
-    spatial_features = compute_all_spatial_features(track, needed_frames)
+    spatial_features = compute_all_spatial_features(track)
 
     logger.info(f"[{match_id}] Step 4/5: Building formation windows and segments...")
     templates = build_templates(track["pitch_length"], track["pitch_width"])

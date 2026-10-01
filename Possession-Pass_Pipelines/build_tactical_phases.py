@@ -87,8 +87,6 @@ from possession_pipeline import (
     PE_TYPE_KEYS, PE_OUTCOME_KEYS, PE_ID_KEYS,
     # Possession-row builder (reused as-is)
     build_possession_row,
-    # Flatten helper (deduplicated: identical to the pipeline's own copy)
-    flatten_event, _SUBDICT_KEYS,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,16 +104,16 @@ GE_EVENT_TYPE_KEYS = ["gameEventType", "game_event_type"]
 NUM_MATCHES = 64
 NUM_WORKERS = 3
 
-MOVEMENT_PARQUET = "output/pass_movement_scores.parquet"
-MOVEMENT_FIGURE  = "output/pass_movement_scores_histogram.png"
+MOVEMENT_PARQUET = "Outputs/SixthRun/pass_movement_scores_test.parquet"
+MOVEMENT_FIGURE  = "Outputs/SixthRun/pass_movement_scores_histogram_test.png"
 RECOMPUTE_MOVEMENT_SCORES = True
 MIN_VALID_OUTFIELDERS = 7
 EXCLUDE_GK = True
 PASS_EVENT_TYPES = ("PA", "CR")
 MAX_REASONABLE_PASS_DURATION = 10.0
 
-OUTPUT_PATH = "output/tactical_phases.parquet"
-FORMATION_WINDOWS_OUTPUT = "output/tactical_phases_formation_windows.parquet"
+OUTPUT_PATH = "Outputs/SixthRun/tactical_phases_test.parquet"
+FORMATION_WINDOWS_OUTPUT = "Outputs/SixthRun/tactical_phases_formation_windows_test.parquet"
 
 THRESHOLD_MEAN     = 2.0
 THRESHOLD_MAX      = 4.0
@@ -125,15 +123,9 @@ MIN_PHASE_FRAMES   = 3
 
 STOPPAGE_EVENT_TYPES = {
     "OUT", "SUB", "OFF", "ON",
-    "FIRSTKICKOFF", "SECONDKICKOFF", "THIRDKICKOFF", "FOURTHKICKOFF",
+    "FIRSTKICKOFF", "SECONDKICKOFF", "THIRD_KICKOFF", "FOURTHKICKOFF",
     "FOUL", "END", "VID",
 }
-# PFF's authoritative dead-ball signal (event spec section 2): `outType` on `OUT` events.
-#   W = Whistle (refereed stoppage), H = Home Score, A = Away Score (ball in the net).
-# Both halt play and end a phase. T = Out of Touch only means the ball crossed the
-# touchline and the same sequence usually continues through the throw-in, so it does not
-# close a phase. Preferred over the hardcoded type list -- see VERIFICATION_FINDINGS.md F6.
-DEAD_BALL_OUT_TYPES = {"W", "H", "A"}
 
 def log(msg, level="INFO"):
     print(f"[{time.time() - _T0:7.1f}s] [{level}] {msg}", flush=True)
@@ -141,12 +133,30 @@ def log(msg, level="INFO"):
 # ==============================================================================
 # GENERIC EVENT HELPERS
 # ==============================================================================
-# `flatten_event`, `_SUBDICT_KEYS`, and `load_flat_events` are imported from
-# possession_pipeline (B8: previously duplicated here, and the two copies had already
-# diverged -- the pipeline's read `grades`, this copy did not).
+_SUBDICT_KEYS = ("gameEvents", "initialTouch", "possessionEvents",
+                 "fouls", "game_event", "possession_event")
+
+def _flatten_event(rec):
+    if not isinstance(rec, dict):
+        return {}
+    flat = dict(rec)
+    for key in _SUBDICT_KEYS:
+        sub = rec.get(key)
+        if isinstance(sub, dict):
+            flat.update(sub)
+    return flat
 
 def _load_events_raw(match_id, processed_dir):
-    return load_flat_events(match_id, processed_dir)
+    p = Path(processed_dir) / str(match_id) / "events.json"
+    if not p.exists():
+        return []
+    with open(p, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if isinstance(raw, dict):
+        raw = raw.get("data", raw.get("events", [raw]))
+    if not isinstance(raw, list):
+        raw = [raw]
+    return [_flatten_event(r) for r in raw if isinstance(r, dict)]
 
 def _event_moment(r):
     t = _get(r, GE_EVENT_TIME_KEYS)
@@ -185,17 +195,8 @@ def _collect_break_times(events):
     for r in events:
         if _get(r, GE_SEQUENCE_KEYS) is not None:
             continue
-        # Authoritative dead-ball signal: a whistle or a score on an OUT event.
-        out_type = _get(r, ["outType"])
-        if out_type in DEAD_BALL_OUT_TYPES:
-            t = _event_moment(r)
-            if t is not None:
-                times.append(t)
-            continue
-        # Fallback: stoppages that carry no OUT record (substitutions, fouls, cards,
-        # kickoffs, END, VID). OUT itself is handled by the whistle/score signal above.
         gtype = _get(r, GE_EVENT_TYPE_KEYS)
-        if gtype not in STOPPAGE_EVENT_TYPES or gtype == "OUT":
+        if gtype not in STOPPAGE_EVENT_TYPES:
             continue
         t = _event_moment(r)
         if t is not None:
@@ -381,7 +382,6 @@ def run_movement_extraction(match_ids):
         log("No scorable passes; aborting.", level="WARN")
         return {}
 
-    Path(MOVEMENT_PARQUET).parent.mkdir(parents=True, exist_ok=True)
     ok.to_parquet(MOVEMENT_PARQUET, index=False)
     log(f"Saved: {MOVEMENT_PARQUET}  ({len(ok):,} scored passes)")
 
@@ -435,13 +435,7 @@ def build_tactical_phases_from_events(events, track, score_lookup,
         home_team = _get(seq_rows[0], GE_HOME_TEAM_KEYS)
         if home_team is None:
             continue
-        # ~1/3 of PFF sequences contain both teams' events (the minority side contributes
-        # defensive actions: clearances, challenges, rebounds). The first event is not a
-        # reliable owner -- a sequence can legitimately open with the defending team -- so
-        # attribute the phase to whichever team supplies the majority of its events.
-        n_home = sum(1 for r in seq_rows if _get(r, GE_HOME_TEAM_KEYS) is True)
-        n_away = sum(1 for r in seq_rows if _get(r, GE_HOME_TEAM_KEYS) is False)
-        team = "home" if n_home >= n_away else "away"
+        team = "home" if home_team else "away"
 
         current_window = []
         window_start_time = None
@@ -527,12 +521,9 @@ def _finalize_phase(seq, team, window_rows, track, reason, counter,
     if not window_rows:
         return None
 
-    period_val = _get(window_rows[0], ["period"])
-    phase_period = int(period_val) if period_val is not None else None
-
     start_idx, end_idx = _possession_frame_bounds(track, window_rows)
     if start_idx is None or end_idx is None:
-        gc_start, gc_end = _game_clock_bounds(track, window_rows, phase_period)
+        gc_start, gc_end = _game_clock_bounds(track, window_rows)
         if gc_start is not None and gc_end is not None:
             start_idx, end_idx = gc_start, gc_end
 
@@ -542,6 +533,8 @@ def _finalize_phase(seq, team, window_rows, track, reason, counter,
         return None
     start_sec = float(min(moments))
     end_sec   = float(max(moments))
+
+    period_val = _get(window_rows[0], ["period"])
     period = int(period_val) if period_val is not None else 1
 
     if start_idx is None or end_idx is None:
@@ -594,9 +587,7 @@ def fit_phase_formation(track, phase_frames, team, period, templates, goalkeeper
     side = team
     xy_arr = track[f"{side}_xy"][phase_frames]
     ids = track[f"{side}_ids"]
-    # goalkeepers are resolved per (side, period) so a substituted keeper is excluded
-    # in the period where the replacement actually plays.
-    gk = goalkeepers.get((side, int(period))) or set()
+    gk = goalkeepers.get(side) or set()
 
     avg_positions = []
     for j, pid in enumerate(ids):
@@ -612,7 +603,7 @@ def fit_phase_formation(track, phase_frames, team, period, templates, goalkeeper
         return None
 
     avg_positions = np.array(avg_positions)
-    orientation = get_orientation(side, period, track)
+    orientation = get_orientation(side, period, track["meta"])
     formation, cost, _ = match_formation(avg_positions, templates, orientation)
     fit_quality = 1.0 / (1.0 + float(cost))
     hier = derive_hierarchy(formation)
@@ -659,12 +650,7 @@ def build_match_phases(match_id, processed_dir, epv_grid, xt_grid, score_lookup)
         if effective_xt_grid is not None else pd.DataFrame()
 
     logger.info(f"[{match_id}] Step 3.5/5: Spatial features ...")
-    # Only frames inside a phase are ever read downstream, so restrict the expensive
-    # per-frame convex-hull loop to that union (mirrors build_match in the pipeline).
-    needed_frames = np.zeros(len(track["period"]), dtype=bool)
-    for ph in phases:
-        needed_frames[frame_range_mask(track, ph["start_frame"], ph["end_frame"])] = True
-    spatial_features = compute_all_spatial_features(track, needed_frames)
+    spatial_features = compute_all_spatial_features(track)
 
     logger.info(f"[{match_id}] Step 4/5: Formation templates + GKs ...")
     templates = build_templates(track["pitch_length"], track["pitch_width"])
@@ -721,14 +707,6 @@ def build_match_phases(match_id, processed_dir, epv_grid, xt_grid, score_lookup)
             failed += 1
 
     logger.info(f"[{match_id}] Phases: {len(phases)}  |  ok: {len(rows)}  |  failed: {failed}")
-    if dropped_by_reason:
-        # ~1/3 of built phases resolve to fewer than MIN_PHASE_FRAMES tracking frames (a
-        # near-instant closedown resolves to one or two frames); report them so the
-        # kept/total ratio is auditable instead of silently shrinking the output.
-        summary = ", ".join(f"{k}={v}" for k, v in sorted(
-            dropped_by_reason.items(), key=lambda kv: -kv[1]))
-        logger.info(f"[{match_id}] Dropped (<{MIN_PHASE_FRAMES} frames): "
-                    f"{sum(dropped_by_reason.values())}  [{summary}]")
 
     poss_df = pd.DataFrame(rows)
 
@@ -769,7 +747,6 @@ def _save_with_pc_map(df, path, grid_x, grid_y):
     df_no_pc = df.drop(columns=["pc_map"])
     table = pa.Table.from_pandas(df_no_pc, preserve_index=False)
     table = table.append_column("pc_map", pc_map_col)
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, path, compression="zstd")
 
 # ==============================================================================
@@ -906,7 +883,6 @@ def main():
                   f"dur={r['duration']:>7.2f}s  closed={r['reason_closed']}")
 
     if all_windows:
-        Path(FORMATION_WINDOWS_OUTPUT).parent.mkdir(parents=True, exist_ok=True)
         pd.concat(all_windows, ignore_index=True).to_parquet(FORMATION_WINDOWS_OUTPUT, index=False)
 
     print(f"\n{'='*70}\nPIPELINE COMPLETE\n{'='*70}")
